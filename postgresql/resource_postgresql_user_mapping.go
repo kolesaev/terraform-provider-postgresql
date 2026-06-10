@@ -2,7 +2,6 @@ package postgresql
 
 import (
 	"bytes"
-	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -112,33 +111,68 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	defer deferredRollback(txn)
 
 	var userMappingOptions []string
-	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
-	err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	var exists bool
 
-	if err != sql.ErrNoRows && err != nil {
-		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available
-		query := "SELECT umoptions FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
-		err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	// 1. Проверяем существование маппинга через открытый pg_user_mappings
+	err = txn.QueryRow("SELECT COUNT(*) > 0 FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("error checking if user mapping exists: %w", err)
 	}
 
-	switch {
-	case err == sql.ErrNoRows:
+	if !exists {
 		log.Printf("[WARN] PostgreSQL user mapping (%s) for server (%s) not found", username, serverName)
 		d.SetId("")
 		return nil
-	case err != nil:
-		return fmt.Errorf("error reading user mapping: %w", err)
 	}
 
+	// 2. Читаем опции из pg_user_mappings (обрабатываем NULL через COALESCE)
+	err = txn.QueryRow("SELECT COALESCE(umoptions, '{}') FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(pq.Array(&userMappingOptions))
+	if err != nil {
+		// Если AWS/GCP вообще запретит читать этот селект не-суперпользователю, спасаем стейт
+		log.Printf("[WARN] Could not read options for user mapping (%s) for server (%s): %v", username, serverName, err)
+		d.Set(userMappingUserNameAttr, username)
+		d.Set(userMappingServerNameAttr, serverName)
+		d.SetId(generateUserMappingID(d))
+		return nil
+	}
+
+	// 3. Парсим то, что вернула база
 	mappedOptions := make(map[string]any)
 	for _, v := range userMappingOptions {
 		pair := strings.SplitN(v, "=", 2)
-		mappedOptions[pair[0]] = pair[1]
+		if len(pair) == 2 {
+			mappedOptions[pair[0]] = pair[1]
+		} else {
+			mappedOptions[pair[0]] = ""
+		}
+	}
+
+	// 4. ЖЕСТКИЙ ФИКС ДЛЯ ОБЛАКОВ (AWS/GCP):
+	// Если в стейте Terraform заданы секреты, а база вернула их пустыми или замаскированными,
+	// мы принудительно восстанавливаем их из стейта, чтобы избежать бесконечного drift loop.
+	if existingOptions, ok := d.GetOk(userMappingOptionsAttr); ok {
+		existingOptionsMap := existingOptions.(map[string]any)
+		
+		for key, value := range existingOptionsMap {
+			lowerKey := strings.ToLower(key)
+			isSensitive := lowerKey == "password" || lowerKey == "pass" || strings.Contains(lowerKey, "secret") || strings.Contains(lowerKey, "token")
+
+			if isSensitive {
+				dbVal, existsInDb := mappedOptions[key]
+				// Если ключа в базе нет, ИЛИ он вернулся пустым, ИЛИ замаскирован звездами
+				if !existsInDb || dbVal == "" || dbVal == "********" {
+					mappedOptions[key] = value
+				}
+			}
+		}
 	}
 
 	d.Set(userMappingUserNameAttr, username)
 	d.Set(userMappingServerNameAttr, serverName)
-	d.Set(userMappingOptionsAttr, mappedOptions)
+	if err := d.Set(userMappingOptionsAttr, mappedOptions); err != nil {
+		return fmt.Errorf("error setting options: %w", err)
+	}
+
 	d.SetId(generateUserMappingID(d))
 
 	return nil
