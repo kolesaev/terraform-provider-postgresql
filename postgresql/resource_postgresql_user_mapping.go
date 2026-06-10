@@ -104,19 +104,24 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	username := d.Get(userMappingUserNameAttr).(string)
 	serverName := d.Get(userMappingServerNameAttr).(string)
 
-	txn, err := startTransaction(db.client, "")
+	txn, err := db.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("error starting transaction: %w", err)
 	}
 	defer deferredRollback(txn)
 
-	var userMappingOptions []string
+	var isSuperuser bool
 	var exists bool
 
-	// 1. Проверяем существование маппинга через открытый pg_user_mappings
-	err = txn.QueryRow("SELECT COUNT(*) > 0 FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(&exists)
+	err = txn.QueryRow("SELECT usesuper FROM pg_catalog.pg_user WHERE usename = CURRENT_USER").Scan(&isSuperuser)
 	if err != nil {
-		return fmt.Errorf("error checking if user mapping exists: %w", err)
+		isSuperuser = false
+	}
+
+	existQuery := "SELECT COUNT(*) > 0 FROM pg_catalog.pg_user_mappings WHERE usename = $1 AND srvname = $2"
+	err = txn.QueryRow(existQuery, username, serverName).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("error checking user mapping existence via pg_catalog: %w", err)
 	}
 
 	if !exists {
@@ -125,56 +130,45 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 		return nil
 	}
 
-	// 2. Читаем опции из pg_user_mappings (обрабатываем NULL через COALESCE)
-	err = txn.QueryRow("SELECT COALESCE(umoptions, '{}') FROM pg_user_mappings WHERE usename = $1 AND srvname = $2", username, serverName).Scan(pq.Array(&userMappingOptions))
-	if err != nil {
-		// Если AWS/GCP вообще запретит читать этот селект не-суперпользователю, спасаем стейт
-		log.Printf("[WARN] Could not read options for user mapping (%s) for server (%s): %v", username, serverName, err)
-		d.Set(userMappingUserNameAttr, username)
-		d.Set(userMappingServerNameAttr, serverName)
-		d.SetId(generateUserMappingID(d))
-		return nil
-	}
+	if isSuperuser {
+		var userMappingOptions []string
+		catalogQuery := "SELECT COALESCE(umoptions, '{}') FROM pg_catalog.pg_user_mappings WHERE usename = $1 AND srvname = $2"
 
-	// 3. Парсим то, что вернула база
-	mappedOptions := make(map[string]any)
-	for _, v := range userMappingOptions {
-		pair := strings.SplitN(v, "=", 2)
-		if len(pair) == 2 {
-			mappedOptions[pair[0]] = pair[1]
-		} else {
-			mappedOptions[pair[0]] = ""
-		}
-	}
-
-	// 4. ЖЕСТКИЙ ФИКС ДЛЯ ОБЛАКОВ (AWS/GCP):
-	// Если в стейте Terraform заданы секреты, а база вернула их пустыми или замаскированными,
-	// мы принудительно восстанавливаем их из стейта, чтобы избежать бесконечного drift loop.
-	if existingOptions, ok := d.GetOk(userMappingOptionsAttr); ok {
-		existingOptionsMap := existingOptions.(map[string]any)
-		
-		for key, value := range existingOptionsMap {
-			lowerKey := strings.ToLower(key)
-			isSensitive := lowerKey == "password" || lowerKey == "pass" || strings.Contains(lowerKey, "secret") || strings.Contains(lowerKey, "token")
-
-			if isSensitive {
-				dbVal, existsInDb := mappedOptions[key]
-				// Если ключа в базе нет, ИЛИ он вернулся пустым, ИЛИ замаскирован звездами
-				if !existsInDb || dbVal == "" || dbVal == "********" {
-					mappedOptions[key] = value
+		err = txn.QueryRow(catalogQuery, username, serverName).Scan(pq.Array(&userMappingOptions))
+		if err == nil {
+			mappedOptions := make(map[string]any)
+			for _, v := range userMappingOptions {
+				pair := strings.SplitN(v, "=", 2)
+				if len(pair) == 2 {
+					mappedOptions[pair[0]] = pair[1]
+				} else {
+					mappedOptions[pair[0]] = ""
 				}
 			}
+
+			d.Set(userMappingUserNameAttr, username)
+			d.Set(userMappingServerNameAttr, serverName)
+			if err := d.Set(userMappingOptionsAttr, mappedOptions); err != nil {
+				return fmt.Errorf("error setting options for superuser: %w", err)
+			}
+			d.SetId(generateUserMappingID(d))
+			return nil
 		}
+		log.Printf("[WARN] Superuser catalog read failed, falling back to state preservation: %v", err)
 	}
+
+	log.Printf("[INFO] Managed cloud environment detected (non-superuser). Preserving local state options to avoid drift loops.")
 
 	d.Set(userMappingUserNameAttr, username)
 	d.Set(userMappingServerNameAttr, serverName)
-	if err := d.Set(userMappingOptionsAttr, mappedOptions); err != nil {
-		return fmt.Errorf("error setting options: %w", err)
+
+	if existingOptions, ok := d.GetOk(userMappingOptionsAttr); ok {
+		if err := d.Set(userMappingOptionsAttr, existingOptions); err != nil {
+			return fmt.Errorf("error preserving options from state: %w", err)
+		}
 	}
 
 	d.SetId(generateUserMappingID(d))
-
 	return nil
 }
 
